@@ -11,7 +11,7 @@
 const LOCAL_RELAY_SERVER_URL: string =
   process.env.REACT_APP_LOCAL_RELAY_SERVER_URL || '';
 
-import { useEffect, useRef, useCallback, useState } from 'react';
+import { useEffect, useRef, useCallback, useState, FormEvent } from 'react';
 
 import { RealtimeClient } from '@openai/realtime-api-beta';
 import { ItemType } from '@openai/realtime-api-beta/dist/lib/client.js';
@@ -124,6 +124,7 @@ export function ConsolePage() {
     lng: -122.418137,
   });
   const [marker, setMarker] = useState<Coordinates | null>(null);
+  const [textInput, setTextInput] = useState<string>('');
 
   /**
    * Utility for formatting the timing of logs
@@ -500,6 +501,23 @@ export function ConsolePage() {
     };
   }, []);
 
+  const handleTextSubmit = useCallback(
+    (event: FormEvent<HTMLFormElement>) => {
+      event.preventDefault();
+      if (textInput.trim() === '') return;
+
+      const client = clientRef.current;
+      client.sendUserMessageContent([
+        {
+          type: 'input_text',
+          text: textInput.trim(),
+        },
+      ]);
+      setTextInput('');
+    },
+    [textInput]
+  );
+
   /**
    * Render the application
    */
@@ -689,6 +707,15 @@ export function ConsolePage() {
                 isConnected ? disconnectConversation : connectConversation
               }
             />
+            <form onSubmit={handleTextSubmit} className="text-input-form">
+              <input
+                type="text"
+                value={textInput}
+                onChange={(e) => setTextInput(e.target.value)}
+                placeholder="Type your message..."
+              />
+              <button type="submit">Send</button>
+            </form>
           </div>
         </div>
         <div className="content-right">
