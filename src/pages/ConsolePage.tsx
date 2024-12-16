@@ -21,11 +21,14 @@ import { WavRenderer } from '../utils/wav_renderer';
 
 import { X, Edit, Zap, ArrowUp, ArrowDown } from 'react-feather';
 import { Button } from '../components/button/Button';
-import { Toggle } from '../components/toggle/Toggle';
-import { Map } from '../components/Map';
+// import { Toggle } from '../components/toggle/Toggle';
+// import { Map } from '../components/Map';
 
 import './ConsolePage.scss';
-import { isJsxOpeningLikeElement } from 'typescript';
+// import { isJsxOpeningLikeElement } from 'typescript';
+
+import OpenAI from 'openai';
+import { Pinecone } from '@pinecone-database/pinecone';
 
 /**
  * Type for result from get_weather() function call
@@ -114,14 +117,15 @@ export function ConsolePage() {
   const [realtimeEvents, setRealtimeEvents] = useState<RealtimeEvent[]>([]);
   const [expandedEvents, setExpandedEvents] = useState<{
     [key: string]: boolean;
-  }>({});
+  }>({}); // this is for the event logs
   const [isConnected, setIsConnected] = useState(false);
   const [canPushToTalk, setCanPushToTalk] = useState(true);
   const [isRecording, setIsRecording] = useState(false);
   const [memoryKv, setMemoryKv] = useState<{ [key: string]: any }>({});
+  const memoryKvRef = useRef<{ [key: string]: any }>({});
   const [coords, setCoords] = useState<Coordinates | null>({
-    lat: 37.775593,
-    lng: -122.418137,
+    lat: 40.7831,
+    lng: -73.9712,
   });
   const [marker, setMarker] = useState<Coordinates | null>(null);
   const [textInput, setTextInput] = useState<string>('');
@@ -147,7 +151,7 @@ export function ConsolePage() {
     return `${pad(m)}:${pad(s)}.${pad(hs)}`;
   }, []);
 
-  /**
+  /*
    * When you click the API key
    */
   const resetAPIKey = useCallback(() => {
@@ -174,21 +178,21 @@ export function ConsolePage() {
     setRealtimeEvents([]);
     setItems(client.conversation.getItems());
 
-    // Connect to microphone
-    await wavRecorder.begin();
+    // // Connect to microphone
+    // await wavRecorder.begin();
 
-    // Connect to audio output
-    await wavStreamPlayer.connect();
+    // // Connect to audio output
+    // await wavStreamPlayer.connect();
 
     // Connect to realtime API
     await client.connect();
-    client.sendUserMessageContent([
-      {
-        type: `input_text`,
-        text: `Hello!`,
-        // text: `For testing purposes, I want you to list ten car brands. Number each item, e.g. "one (or whatever number you are one): the item name".`
-      },
-    ]);
+    // client.sendUserMessageContent([
+    //   {
+    //     type: `input_text`,
+    //     text: `Hello! My name is Kevin.`,
+    //     // text: `For testing purposes, I want you to list ten car brands. Number each item, e.g. "one (or whatever number you are one): the item name".`
+    //   },
+    // ]);
 
     if (client.getTurnDetectionType() === 'server_vad') {
       await wavRecorder.record((data) => client.appendInputAudio(data.mono));
@@ -204,8 +208,8 @@ export function ConsolePage() {
     setItems([]);
     setMemoryKv({});
     setCoords({
-      lat: 37.775593,
-      lng: -122.418137,
+      lat: 40.7831,
+      lng: -73.9712,
     });
     setMarker(null);
 
@@ -377,8 +381,18 @@ export function ConsolePage() {
     const wavStreamPlayer = wavStreamPlayerRef.current;
     const client = clientRef.current;
 
+    // Query Pinecone
+    const pinecone = new Pinecone({
+      apiKey: '4ce3b21d-585f-49be-8a48-cbf77acf593d',
+    });
+    const index = pinecone.Index('job-profiles');
+
+    // Get embedding from OpenAI
+    const openai = new OpenAI({ apiKey: apiKey, dangerouslyAllowBrowser: true });
     // Set instructions
     client.updateSession({ instructions: instructions });
+    client.updateSession({ voice: 'alloy'})
+    client.updateSession({ modalities: ['text']})
     // Set transcription, otherwise we don't get user transcriptions back
     client.updateSession({ input_audio_transcription: { model: 'whisper-1' } });
 
@@ -407,9 +421,33 @@ export function ConsolePage() {
         setMemoryKv((memoryKv) => {
           const newKv = { ...memoryKv };
           newKv[key] = value;
+          memoryKvRef.current = newKv;
           return newKv;
         });
         return { ok: true };
+      }
+    );
+    client.addTool(
+      {
+        name: 'get_memory',
+        description: 'Retrieves data from memory that was previously stored with set_memory.',
+        parameters: {
+          type: 'object',
+          properties: {
+            key: {
+              type: 'string',
+              description: 'The key of the memory value to retrieve.',
+            },
+          },
+          required: ['key'],
+        },
+      },
+      async ({ key }: { [key: string]: any }) => {
+        const value = memoryKvRef.current[key];
+        if (value === undefined) {
+          return { error: `No value found for key "${key}".` };
+        }
+        return { key, value };
       }
     );
     client.addTool(
@@ -455,6 +493,266 @@ export function ConsolePage() {
         return json;
       }
     );
+    client.addTool(
+      {
+        name: 'findJobCandidates',
+        description: `Search for job candidates in the vector database.`,
+        parameters: {
+          type: 'object',
+          properties: {
+            searchText: {
+              type: 'string',
+              description: 'Natural language description of the candidate you\'re looking for',
+            },
+            filters: {
+              type: 'object',
+              description: 'Optional filters for the search',
+            },
+            topK: {
+              type: 'number',
+              description: 'Number of results to return',
+            },
+          },
+          required: ['searchText'],
+        },
+      },
+      async ({ searchText, filters, topK }: { [key: string]: any }) => {
+        if (!searchText) {
+          return {
+            error: "Missing searchText parameter"
+          };
+        }
+    
+        try {
+          const response = await fetch('http://127.0.0.1:5000/search', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+              query_text: searchText,
+              filters: filters || {},
+              top_k: topK || 10,
+            })
+          });
+    
+          if (!response.ok) {
+            const error = await response.json();
+            return { error: error.error };
+          }
+    
+          const data = await response.json();
+          return { candidates: data.results };
+    
+        } catch (error: unknown) {
+          return { error: error instanceof Error ? error.message : String(error) };
+        }
+      }
+    );
+    
+    // client.addTool(
+    //   {
+    //     name: 'send_whatsapp_message',
+    //     description: 'Sends a WhatsApp message to the user\'s phone number. Requires a text parameter.',
+    //     parameters: {
+    //       type: 'object',
+    //       properties: {
+    //         text: {
+    //           type: 'string',
+    //           description: 'Required: Message text to send to the user.',
+    //         },
+    //       },
+    //       required: ['text'],
+    //     },
+    //   },
+    //   async ({ text }: { phoneNumber: string, text: string }) => {   
+    //     try {
+    //       // Use default phone number if none provided
+    //       const recipientNumber = '18578560403';
+    
+    //       const response = await fetch(
+    //         // `https://graph.facebook.com/v20.0/374133159126843/messages`, // this is the dev
+    //         `https://graph.facebook.com/v20.0/396252976911143/messages`, // this is the prod
+    //         {
+    //           method: 'POST',
+    //           headers: {
+    //             // 'Authorization': 'Bearer EAAga904JwlsBO4duj9RAUVW4z8zZCQcLq1SyJAtd4AmFJOgbvOGwBq9hiZA75seFNKBuRLhdqYcV5QmJBU5ZBYcNzsuuGlqad6wZCvh7k5RUUEZAfXnrrtDR6SStT0CjfQc0H0cC9E96WHtXaVuwd3hJGesOu8ZCwBCz4q2gbmo5pbXJjAq5JaMfYF0A7DwBgd',
+    //             'Authorization': 'Bearer EAAga904JwlsBO4duj9RAUVW4z8zZCQcLq1SyJAtd4AmFJOgbvOGwBq9hiZA75seFNKBuRLhdqYcV5QmJBU5ZBYcNzsuuGlqad6wZCvh7k5RUUEZAfXnrrtDR6SStT0CjfQc0H0cC9E96WHtXaVuwd3hJGesOu8ZCwBCz4q2gbmo5pbXJjAq5JaMfYF0A7DwBgd',
+    //             'Content-Type': 'application/json',
+    //           },
+    //           body: JSON.stringify({
+    //             messaging_product: "whatsapp",
+    //             to: recipientNumber,
+    //             type: "text",
+    //             recipient_type: 'individual',
+    //             text: {
+    //               body: text,
+    //             },
+    //           }),
+    //         }
+    //       );
+    
+    //       if (!response.ok) {
+    //         const errorData = await response.json();
+    //         throw new Error(errorData.error?.message || 'Failed to send message');
+    //       }
+    
+    //       const data = await response.json();
+    //       return { 
+    //         success: true, 
+    //         message: `Message sent successfully to ${recipientNumber}`, 
+    //         data 
+    //       };
+    //     } catch (error) {
+    //       const errorMessage = error instanceof Error ? error.message : 'Unknown error occurred';
+    //       return { success: false, error: `Error sending WhatsApp message: ${errorMessage}` };
+    //     }
+    //   }
+    // );
+
+    client.addTool(
+      {
+        name: 'searchGoogle',
+        description: 'Performs a Google search for the given query and returns top results.',
+        parameters: {
+          type: 'object',
+          properties: {
+            query: {
+              type: 'string',
+              description: 'Search query text.',
+            },
+          },
+          required: ['query'],
+        },
+      },
+      async ({ query }: { query: string }) => {
+        try {
+          if (!query) {
+            return {
+              error: "Search query cannot be empty"
+            };
+          }
+
+          const response = await fetch('http://127.0.0.1:5000/search-google', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({ query })
+          });
+          
+          if (!response.ok) {
+            const error = await response.json();
+            return { error: error.error || 'Failed to perform search' };
+          }
+
+          // Return the response directly since Flask already formats it
+          return await response.json();
+
+        } catch (error) {
+          console.error('SearchGoogle Error:', error);
+          return {
+            error: error instanceof Error ? error.message : 'An unknown error occurred'
+          };
+        }
+      }
+    );
+
+    client.addTool(
+      {
+        name: 'extractTextFromUrl',
+        description: 'Extracts readable text content from a given URL, excluding scripts, styles, and navigation elements. Works best with article pages and blog posts.',
+        parameters: {
+          type: 'object',
+          properties: {
+            url: {
+              type: 'string',
+              description: 'The URL to extract text from',
+            },
+            timeout: {
+              type: 'number',
+              description: 'Optional timeout in seconds for the request',
+              default: 20
+            },
+          },
+          required: ['url'],
+        },
+      },
+      async ({ url, timeout = 20 }: { url: string; timeout?: number }) => {
+        try {
+          const response = await fetch('http://127.0.0.1:5000/extract-text', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+              url,
+              timeout
+            })
+          });
+
+          if (!response.ok) {
+            const error = await response.json();
+            return { error: error.error || 'Failed to extract text from URL' };
+          }
+
+          return await response.json();
+
+        } catch (error) {
+          return {
+            error: error instanceof Error ? error.message : 'An unknown error occurred while extracting text'
+          };
+        }
+      }
+    );
+
+    client.addTool(
+      {
+        name: 'searchGoogleNews',
+        description: 'Performs a Google News search for the given query and returns top news results.',
+        parameters: {
+          type: 'object',
+          properties: {
+            query: {
+              type: 'string',
+              description: 'Search query text for news articles.',
+            },
+          },
+          required: ['query'],
+        },
+      },
+      async ({ query }: { query: string }) => {
+        try {
+          if (!query) {
+            return {
+              error: "Search query cannot be empty"
+            };
+          }
+
+          const response = await fetch('http://127.0.0.1:5000/search-google-news', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({ query })
+          });
+          
+          if (!response.ok) {
+            const error = await response.json();
+            return { error: error.error || 'Failed to perform news search' };
+          }
+
+          // Return the response directly since Flask already formats it
+          return await response.json();
+
+        } catch (error) {
+          console.error('SearchGoogleNews Error:', error);
+          return {
+            error: error instanceof Error ? error.message : 'An unknown error occurred'
+          };
+        }
+      }
+    );
 
     // handle realtime events from client + server for event logging
     client.on('realtime.event', (realtimeEvent: RealtimeEvent) => {
@@ -477,11 +775,36 @@ export function ConsolePage() {
         await client.cancelResponse(trackId, offset);
       }
     });
+
+    // let functionCallStreak = 0; // Put this line right before client.on('conversation.updated') inside the useEffect
+    // let solveCheckTimeout: NodeJS.Timeout | null = null;
+
     client.on('conversation.updated', async ({ item, delta }: any) => {
       const items = client.conversation.getItems();
+      
+
+      // If assistant completes a message, reset the streak
+      // if (item.role === 'assistant' && item.status === 'completed') {
+      //   functionCallStreak = 0;
+      // }
+
+      // If we got a function_call_output item
+      // if (item.type === 'function_call_output') {
+      //   functionCallStreak++;
+      //   if (functionCallStreak > 10) {
+      //     // Ask the assistant to finalize because it's stuck
+      //     client.sendUserMessageContent([{
+      //       type: 'input_text',
+      //       text: 'It seems we are stuck in a loop. Please provide a final summary and end the conversation by calling set_memory({"key":"terminate","value":"true"}).'
+      //     }]);
+      // functionCallStreak = 0;
+      //   }
+      // }
+
       if (delta?.audio) {
         wavStreamPlayer.add16BitPCM(delta.audio, item.id);
       }
+
       if (item.status === 'completed' && item.formatted.audio?.length) {
         const wavFile = await WavRecorder.decode(
           item.formatted.audio,
@@ -490,6 +813,17 @@ export function ConsolePage() {
         );
         item.formatted.file = wavFile;
       }
+
+      // if (item.status === 'completed' && item.role === 'assistant') {
+      //   console.log("item:", item.status, item.role);
+      //   client.sendUserMessageContent([
+      //     {
+      //       type: 'input_text',
+      //       text: 'Did you sufficiently solve the task? If there is anything missing or some data you could not get, please respond "No" and explain what you still need and keep checking different sources to find the data'
+      //     },
+      //   ]);
+      // }    
+
       setItems(items);
     });
 
@@ -502,11 +836,26 @@ export function ConsolePage() {
   }, []);
 
   const handleTextSubmit = useCallback(
-    (event: FormEvent<HTMLFormElement>) => {
+    async (event: FormEvent<HTMLFormElement>) => {
       event.preventDefault();
       if (textInput.trim() === '') return;
 
+      if (!isConnected) {
+        alert('You need to connect first');
+        return;
+      } // to alert the user that they need to connect first
+
       const client = clientRef.current;
+      const wavStreamPlayer = wavStreamPlayerRef.current;
+
+      // Interrupt the assistant if it's responding
+      const trackSampleOffset = await wavStreamPlayer.interrupt();
+      if (trackSampleOffset?.trackId) {
+        const { trackId, offset } = trackSampleOffset;
+        await client.cancelResponse(trackId, offset);
+      }
+
+      // Send the new text input
       client.sendUserMessageContent([
         {
           type: 'input_text',
@@ -515,7 +864,7 @@ export function ConsolePage() {
       ]);
       setTextInput('');
     },
-    [textInput]
+    [textInput, isConnected]
   );
 
   /**
@@ -525,8 +874,9 @@ export function ConsolePage() {
     <div data-component="ConsolePage">
       <div className="content-top">
         <div className="content-title">
-          <img src="/openai-logomark.svg" />
-          <span>realtime console</span>
+          {/* <img src="/openai-logomark.svg" /> */}
+          {/* <img src="/circle-logomark.png" /> */}
+          <span>Realtime Agent</span>
         </div>
         <div className="content-api-key">
           {!LOCAL_RELAY_SERVER_URL && (
@@ -542,16 +892,16 @@ export function ConsolePage() {
       </div>
       <div className="content-main">
         <div className="content-logs">
-          <div className="content-block events">
-            <div className="visualization">
+          {/* <div className="content-block events"> */}
+            {/* <div className="visualization">
               <div className="visualization-entry client">
                 <canvas ref={clientCanvasRef} />
               </div>
               <div className="visualization-entry server">
                 <canvas ref={serverCanvasRef} />
               </div>
-            </div>
-            <div className="content-block-title">events</div>
+            </div> */}
+            {/* <div className="content-block-title">events</div>
             <div className="content-block-body" ref={eventsScrollRef}>
               {!realtimeEvents.length && `awaiting connection...`}
               {realtimeEvents.map((realtimeEvent, i) => {
@@ -614,12 +964,12 @@ export function ConsolePage() {
                   </div>
                 );
               })}
-            </div>
-          </div>
+            </div> */}
+          {/* </div> */}
           <div className="content-block conversation">
             <div className="content-block-title">conversation</div>
             <div className="content-block-body" data-conversation-content>
-              {!items.length && `awaiting connection...`}
+              {!items.length && `click connect to start`}
               {items.map((conversationItem, i) => {
                 return (
                   <div className="conversation-item" key={conversationItem.id}>
@@ -681,32 +1031,32 @@ export function ConsolePage() {
             </div>
           </div>
           <div className="content-actions">
-            <Toggle
-              defaultValue={false}
-              labels={['manual', 'vad']}
-              values={['none', 'server_vad']}
-              onChange={(_, value) => changeTurnEndType(value)}
-            />
-            <div className="spacer" />
-            {isConnected && canPushToTalk && (
+            <div className="actions-buttons">
+              {/* <Toggle
+                defaultValue={false}
+                labels={['manual', 'vad']}
+                values={['none', 'server_vad']}
+                onChange={(_, value) => changeTurnEndType(value)}
+              /> */}
+              {/* {isConnected && canPushToTalk && (
+                <Button
+                  label={isRecording ? 'release to send' : 'push to talk'}
+                  buttonStyle={isRecording ? 'alert' : 'regular'}
+                  disabled={!isConnected || !canPushToTalk}
+                  onMouseDown={startRecording}
+                  onMouseUp={stopRecording}
+                />
+              )} */}
               <Button
-                label={isRecording ? 'release to send' : 'push to talk'}
-                buttonStyle={isRecording ? 'alert' : 'regular'}
-                disabled={!isConnected || !canPushToTalk}
-                onMouseDown={startRecording}
-                onMouseUp={stopRecording}
+                label={isConnected ? 'disconnect' : 'connect'}
+                iconPosition={isConnected ? 'end' : 'start'}
+                icon={isConnected ? X : Zap}
+                buttonStyle={isConnected ? 'regular' : 'action'}
+                onClick={
+                  isConnected ? disconnectConversation : connectConversation
+                }
               />
-            )}
-            <div className="spacer" />
-            <Button
-              label={isConnected ? 'disconnect' : 'connect'}
-              iconPosition={isConnected ? 'end' : 'start'}
-              icon={isConnected ? X : Zap}
-              buttonStyle={isConnected ? 'regular' : 'action'}
-              onClick={
-                isConnected ? disconnectConversation : connectConversation
-              }
-            />
+            </div>
             <form onSubmit={handleTextSubmit} className="text-input-form">
               <input
                 type="text"
@@ -719,6 +1069,8 @@ export function ConsolePage() {
           </div>
         </div>
         <div className="content-right">
+          {/* Remove or comment out the following block to remove the weather showcase panel */}
+          {/* 
           <div className="content-block map">
             <div className="content-block-title">get_weather()</div>
             <div className="content-block-title bottom">
@@ -745,6 +1097,8 @@ export function ConsolePage() {
               )}
             </div>
           </div>
+          */}
+          {/* Keep the set_memory() block or any other components you need */}
           <div className="content-block kv">
             <div className="content-block-title">set_memory()</div>
             <div className="content-block-body content-kv">
